@@ -27,7 +27,8 @@ MAX_LSB_ERROR = 6
 PROJECT_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = PROJECT_ROOT / "results"
 BUILD_DIR = PROJECT_ROOT / "build"
-STIMULI = ("impulse", "constant", "tone", "square", "multitone")
+STIMULI = ("impulse", "constant", "tone", "square", "multitone", "ofdm")
+OFDM_NUM_CARRIERS = 1200
 
 
 def _twos_complement(value: int, width: int) -> int:
@@ -36,6 +37,19 @@ def _twos_complement(value: int, width: int) -> int:
     if value & (1 << (width - 1)):
         value -= 1 << width
     return value
+
+
+def _ofdm_active_indices() -> np.ndarray:
+    half = OFDM_NUM_CARRIERS // 2
+    positive = np.arange(1, half + 1, dtype=np.int32)
+    negative = np.arange(TRANSFORM_LENGTH - half, TRANSFORM_LENGTH, dtype=np.int32)
+    return np.concatenate((negative, positive))
+
+
+def _ofdm_qpsk_symbols() -> np.ndarray:
+    rng = np.random.default_rng(2025)
+    mapping = np.array([1 + 1j, 1 - 1j, -1 + 1j, -1 - 1j], dtype=np.complex128) / np.sqrt(2)
+    return mapping[rng.integers(0, len(mapping), size=OFDM_NUM_CARRIERS)]
 
 
 def _generate_vector(stimulus: str) -> np.ndarray:
@@ -71,6 +85,17 @@ def _generate_vector(stimulus: str) -> np.ndarray:
         )
         vector[:, 0] = np.clip(np.round(amp * real), np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)
         vector[:, 1] = np.clip(np.round(amp * imag), np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)
+    elif stimulus == "ofdm":
+        indices = _ofdm_active_indices()
+        symbols = _ofdm_qpsk_symbols()
+        freq_bins = np.zeros(TRANSFORM_LENGTH, dtype=np.complex128)
+        freq_bins[indices] = symbols
+        time_domain = np.fft.ifft(freq_bins)
+        max_mag = float(np.max(np.abs(time_domain)))
+        scale = (0.85 * np.iinfo(np.int16).max) / max_mag if max_mag > 0 else 1.0
+        time_domain *= scale
+        vector[:, 0] = np.round(time_domain.real).astype(np.int16)
+        vector[:, 1] = np.round(time_domain.imag).astype(np.int16)
     else:
         raise RuntimeError(f"Unsupported stimulus '{stimulus}'")
     return vector
@@ -117,15 +142,20 @@ def _load_results(path: Path) -> dict[str, np.ndarray]:
         return {key: data[key].astype(np.int16) for key in data.files}
 
 
-def _compute_reference(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _compute_reference(case: str, data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     inputs = np.column_stack((data["input_real"], data["input_imag"]))
     ref_real, ref_imag = _reference_fft(inputs)
-    return {"ref_real": ref_real, "ref_imag": ref_imag}
+    reference = {"ref_real": ref_real, "ref_imag": ref_imag}
+    if case == "ofdm":
+        reference["constellation_indices"] = _ofdm_active_indices()
+    return reference
 
 
 def _plot_case(case: str, data: dict[str, np.ndarray], reference: dict[str, np.ndarray]) -> Path:
     indices = np.arange(data["input_real"].size)
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 8))
+    num_rows = 4 if case == "ofdm" else 3
+    fig, axes = plt.subplots(num_rows, 1, sharex=False, figsize=(10, 9 if case == "ofdm" else 8))
+    axes = np.atleast_1d(axes)
 
     axes[0].plot(indices, data["input_real"], label="real")
     axes[0].plot(indices, data["input_imag"], label="imag", linestyle="--")
@@ -149,6 +179,19 @@ def _plot_case(case: str, data: dict[str, np.ndarray], reference: dict[str, np.n
     axes[2].set_ylabel("LSB")
     axes[2].set_xlabel("Sample index")
     axes[2].legend()
+
+    if case == "ofdm":
+        const_ax = axes[3]
+        freq_hw = (data["output_real"].astype(np.int32) + 1j * data["output_imag"].astype(np.int32)) * TRANSFORM_LENGTH
+        freq_ref = (reference["ref_real"].astype(np.int32) + 1j * reference["ref_imag"].astype(np.int32)) * TRANSFORM_LENGTH
+        active = reference.get("constellation_indices", _ofdm_active_indices())
+        const_ax.scatter(freq_ref[active].real, freq_ref[active].imag, label="ref", s=12, alpha=0.6)
+        const_ax.scatter(freq_hw[active].real, freq_hw[active].imag, label="hw", s=12, marker="x")
+        const_ax.set_title("Constellation (active carriers)")
+        const_ax.set_xlabel("In-phase")
+        const_ax.set_ylabel("Quadrature")
+        const_ax.grid(True, alpha=0.3)
+        const_ax.legend()
 
     fig.tight_layout()
     image_path = RESULTS_DIR / f"{case}.png"
@@ -246,7 +289,7 @@ def main() -> None:
     result_files = run_simulation(STIMULI)
     for case, result in zip(STIMULI, result_files):
         data = _load_results(result)
-        reference = _compute_reference(data)
+        reference = _compute_reference(case, data)
         _plot_case(case, data, reference)
 
 
