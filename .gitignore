@@ -5,7 +5,6 @@ build/
 dist/
 wheels/
 *.egg-info
-results/
-
+*.npz
 # Virtual environments
 .venv
